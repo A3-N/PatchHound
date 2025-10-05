@@ -1,0 +1,15 @@
+# env
+.venv/
+__pycache__/
+
+# uv artifacts
+uv.lock
+
+# dumps / secrets
+*.dit
+*ntds*
+*.pot
+*.potfile
+*.dmp
+dumps/
+notes/
