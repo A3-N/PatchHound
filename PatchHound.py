@@ -61,26 +61,6 @@ def main():
             print(f"{m['warn']} {e}")
             sys.exit(1)
 
-    elif args.command == "search":
-        try:
-            from src.search import search
-            results = search(
-                base_url="http://localhost:8080/",
-                query=args.query,
-                node_type=args.type,
-                verbose=args.verbose
-            )
-            if args.verbose:
-                import json
-                print(json.dumps(results, indent=2))
-            sys.exit(0)
-        except KeyboardInterrupt:
-            print(f"\n{m['warn']} CTRL+C detected, exiting cleanly.")
-            sys.exit(130)
-        except Exception as e:
-            print(f"{m['warn']} {e}")
-            sys.exit(1)
-
     else:
         parser.print_help()
         sys.exit(0)
