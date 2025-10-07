@@ -14,4 +14,3 @@ uv.lock
 *.json
 dumps/
 notes/
-.python-version
