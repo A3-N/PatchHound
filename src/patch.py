@@ -1,82 +1,41 @@
+# src/patch.py
+#!/usr/bin/env python3
+import os
 import re
 import sys
-from collections import defaultdict
+import json
+import tempfile
+import requests
+from typing import Tuple, List, Dict, Optional
+
+from src.conn import DEFAULT_URI, DEFAULT_USER, DEFAULT_PASS
 from src.pwetty import progress_bar
+
+# ----------------------------
+# Constants
+# ----------------------------
+SESSION_PATH = os.path.join(tempfile.gettempdir(), "patchhound.session.json")
 
 BATCH_SIZE = 1000
 APPLY_STEP = 50
 
 HEX32 = re.compile(r'\b[a-fA-F0-9]{32}\b')
 HEX_WRAP = re.compile(r'^\s*\$HEX\[([0-9A-Fa-f]+)\]\s*$')
+UPN_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 
-class PatchContext:
-    def __init__(self, potfile, ntlm_path, uri, user, password, verbose=False, nocolor=False):
-        self.potfile = potfile
-        self.ntlm_path = ntlm_path
-        self.uri = uri
-        self.user = user
-        self.password = password
-        self.verbose = verbose
-        self.nocolor = nocolor
+# To avoid terminal spam on massive inputs; set to None to print all
+EXCLUDED_PRINT_LIMIT = 200
+HEX_PRINT_LIMIT = 200
 
-def _decode_hex_pw(pw):
-    m = HEX_WRAP.match(pw)
-    if not m:
-        return pw, False
-    try:
-        b = bytes.fromhex(m.group(1))
-        try:
-            return b.decode("utf-8"), True
-        except UnicodeDecodeError:
-            return b.decode("latin-1"), True
-    except Exception:
-        return pw, False
 
-def _load_potfile(path):
-    cracked = {}
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            s = raw.strip()
-            if not s or s.startswith("#") or ":" not in s:
-                continue
-            h, pwd = s.split(":", 1)
-            h = h.strip().lower()
-            decoded, _ = _decode_hex_pw(pwd)
-            cracked[h] = decoded
-    return cracked
+# ----------------------------
+# UI helpers
+# ----------------------------
+def _make_markers(nocolor: bool) -> Dict[str, str]:
+    return {"ok": "[+]", "info": "[*]", "warn": "[!]"}
 
-def _canonicalize_account(tokens):
-    for t in tokens:
-        t = t.strip()
-        if "\\" in t:
-            return t
-    return tokens[0].strip() if tokens else None
 
-def _split_account(acct):
-    if "\\" in acct:
-        dom, sam = acct.split("\\", 1)
-        return dom, sam
-    return None, acct
-
-def _load_ntlm_file(path):
-    pairs = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            hashes = HEX32.findall(line)
-            if not hashes:
-                continue
-            tokens = [p for p in re.split(r'[:\s,;]+', line) if p]
-            acct = _canonicalize_account(tokens)
-            if not acct:
-                continue
-            for h in hashes:
-                pairs.append((acct, h.lower()))
-    return pairs
-
-def _progress(done, total, prefix, nocolor):
+def _progress(done: int, total: int, prefix: str, nocolor: bool):
     bar, pct = progress_bar(done, total, nocolor, width=28)
     sys.stdout.write(f"\r{prefix} [{bar}] {done}/{total} ({pct}%)")
     sys.stdout.flush()
@@ -84,22 +43,279 @@ def _progress(done, total, prefix, nocolor):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+
+# ----------------------------
+# Session / I/O helpers
+# ----------------------------
+def _load_session() -> Tuple[str, str]:
+    if not os.path.exists(SESSION_PATH):
+        raise RuntimeError("No session found — run `auth` first.")
+    try:
+        with open(SESSION_PATH, "r") as f:
+            data = json.load(f)
+    except Exception:
+        raise RuntimeError("Session file is invalid — re-run `auth`.")
+    base_url = data.get("base_url")
+    token = data.get("session_token")
+    if not base_url or not token:
+        raise RuntimeError("Session file missing base_url or session_token — re-run `auth`.")
+    return base_url, token
+
+
+def _redact_token(tok: str) -> str:
+    if not tok:
+        return "<missing>"
+    return tok[:6] + "..." + tok[-6:] if len(tok) > 12 else tok[:3] + "..." + tok[-3:]
+
+
+def _redact_secret(_: str) -> str:
+    return "████████"
+
+
+def _extract_error_message(resp) -> str:
+    try:
+        body = resp.json()
+        errs = body.get("errors")
+        if isinstance(errs, list) and errs:
+            msg = errs[0].get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+    except ValueError:
+        pass
+    return "Error"
+
+
+def _check_file(path: str, what: str):
+    if not path:
+        return
+    if not os.path.exists(path):
+        raise RuntimeError(f"{what} not found: {path}")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"{what} is not a file: {path}")
+
+
+# ----------------------------
+# Potfile / NTLM parsing + stats
+# ----------------------------
+def _decode_hex_pw(pw: str) -> Tuple[str, bool, Optional[str]]:
+    """
+    Returns (decoded_text, was_hex, original_hex_token_when_present)
+    """
+    m = HEX_WRAP.match(pw)
+    if not m:
+        return pw, False, None
+    try:
+        b = bytes.fromhex(m.group(1))
+        try:
+            return b.decode("utf-8"), True, m.group(0)
+        except UnicodeDecodeError:
+            return b.decode("latin-1"), True, m.group(0)
+    except Exception:
+        return pw, False, None
+
+
+def _analyze_potfile(path: str) -> Dict[str, object]:
+    """
+    Expected format: <32-hex-ntlm>:<password>
+    Stats include excluded lines (with reason) and HEX decodes.
+    """
+    stats = {
+        "lines_total": 0,
+        "entries_total": 0,
+        "valid_entries": 0,
+        "excluded_count": 0,
+        "ntlm32_valid": 0,
+        "hex_wrapped": 0,
+        "hex_decoded": 0,
+        "unique_hashes": 0,
+        "excluded_lines": [],
+        "hex_decoded_lines": [],
+    }
+    cracked: Dict[str, str] = {}
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            stats["lines_total"] += 1
+            line = raw.rstrip("\n")
+            s = line.strip()
+
+            if not s or s.startswith("#"):
+                stats["excluded_lines"].append(f"blank_or_comment | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            stats["entries_total"] += 1
+            if ":" not in s:
+                stats["excluded_lines"].append(f"no_colon | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            h, pwd = s.split(":", 1)
+            h = h.strip().lower()
+
+            if HEX32.fullmatch(h) is None:
+                stats["excluded_lines"].append(f"hash_not_32hex | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            stats["valid_entries"] += 1
+            stats["ntlm32_valid"] += 1
+
+            decoded, was_hex, orig_token = _decode_hex_pw(pwd)
+            if was_hex:
+                stats["hex_wrapped"] += 1
+                stats["hex_decoded"] += 1
+                stats["hex_decoded_lines"].append(f"{h}:{orig_token}:{decoded}")
+
+            cracked[h] = decoded
+
+    stats["unique_hashes"] = len(cracked)
+    stats["_cracked_map"] = cracked
+    return stats
+
+
+def _canonicalize_account(tokens: List[str]) -> Optional[str]:
+    for t in tokens:
+        t = t.strip()
+        if "\\" in t:
+            return t
+    return tokens[0].strip() if tokens else None
+
+
+def _extract_upn(tokens: List[str]) -> Optional[str]:
+    for t in tokens:
+        t = t.strip()
+        if UPN_RE.match(t):
+            return t
+    return None
+
+
+def _split_account(acct: str):
+    if "\\" in acct:
+        dom, sam = acct.split("\\", 1)
+        return dom, sam
+    return None, acct
+
+
+def _analyze_ntlm_file(path: str) -> Dict[str, object]:
+    """
+    Expected: at least one 32-hex hash + an account token (prefer DOMAIN\\user).
+    Captures explicit UPN tokens; if absent and DOMAIN looks FQDN, synthesizes UPN.
+    """
+    stats = {
+        "lines_total": 0,
+        "lines_with_hash": 0,
+        "hashes_total": 0,
+        "unique_hashes": 0,
+        "accounts_total": 0,
+        "pairs_total": 0,
+        "unique_pairs": 0,
+        "valid_records": 0,
+        "excluded_count": 0,
+        "excluded_lines": [],
+    }
+    records: List[Dict[str, str]] = []
+    hashes_seen = set()
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            stats["lines_total"] += 1
+            line = raw.rstrip("\n")
+            s = line.strip()
+
+            if not s or s.startswith("#"):
+                stats["excluded_lines"].append(f"blank_or_comment | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            hashes = HEX32.findall(s)
+            if hashes:
+                stats["lines_with_hash"] += 1
+                stats["hashes_total"] += len(hashes)
+
+            tokens = [p for p in re.split(r'[:\s,;]+', s) if p]
+            acct = _canonicalize_account(tokens)
+            upn = _extract_upn(tokens)  # explicit UPN token if present
+
+            if acct:
+                stats["accounts_total"] += 1
+
+            if not hashes:
+                stats["excluded_lines"].append(f"no_32hex_hash | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            if not acct:
+                stats["excluded_lines"].append(f"no_account_token | {line}")
+                stats["excluded_count"] += 1
+                continue
+
+            dom, sam = _split_account(acct)
+
+            # Synthesize UPN from DOMAIN\sam when domain looks FQDN; keep case-insensitive downstream
+            if not upn and dom and '.' in dom and sam:
+                upn = f"{sam}@{dom.lower()}"
+
+            rec_sam = (sam or "").upper()
+            rec_upn = (upn or "").upper()  # normalize for case-insensitive matching
+
+            for h in hashes:
+                h = h.lower()
+                records.append({"name": acct, "sam": rec_sam, "upn": rec_upn, "nt": h})
+                hashes_seen.add(h)
+                stats["valid_records"] += 1
+
+    # unique (acct,hash) pairs
+    seen_pairs = set()
+    out_records: List[Dict[str, str]] = []
+    for rec in records:
+        key = (rec["name"].lower(), rec["nt"])
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        out_records.append(rec)
+
+    stats["unique_hashes"] = len(hashes_seen)
+    stats["pairs_total"] = len(records)
+    stats["unique_pairs"] = len(out_records)
+    stats["_records"] = out_records
+    return stats
+
+
+# ----------------------------
+# Neo4j matching & updates (no fallbacks; union of all forms)
+# ----------------------------
 def _pre_match(session, rows):
+    """
+    Match across all forms at once:
+      - :User {name}
+      - :User.samaccountname
+      - :User.userprincipalname / userPrincipalName
+      - :AZUser.userprincipalname / userPrincipalName
+      - :Computer.samaccountname
+    """
     q = """
     UNWIND $rows AS r
     OPTIONAL MATCH (u_exact:User {name:r.name})
-    WITH r, collect(u_exact) AS exacts
-    CALL {
-      WITH r, exacts
-      OPTIONAL MATCH (u_sam:User)
-        WHERE size(exacts)=0 AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
-      WITH r, exacts, collect(u_sam) AS sam_users
-      OPTIONAL MATCH (c:Computer)
-        WHERE size(exacts)=0 AND toUpper(coalesce(c.samaccountname,'')) = r.sam
-      WITH r, exacts, sam_users, collect(c) AS comps
-      RETURN CASE WHEN size(exacts)>0 THEN exacts ELSE sam_users + comps END AS targets
-    }
-    WITH r, targets
+
+    OPTIONAL MATCH (u_sam:User)
+      WHERE r.sam <> '' AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
+
+    OPTIONAL MATCH (u_upn:User)
+      WHERE r.upn <> '' AND toUpper(coalesce(u_upn.userprincipalname, u_upn.userPrincipalName, '')) = r.upn
+
+    OPTIONAL MATCH (az_upn:AZUser)
+      WHERE r.upn <> '' AND toUpper(coalesce(az_upn.userprincipalname, az_upn.userPrincipalName, '')) = r.upn
+
+    OPTIONAL MATCH (c:Computer)
+      WHERE r.sam <> '' AND toUpper(coalesce(c.samaccountname,'')) = r.sam
+
+    WITH r,
+         (CASE WHEN u_exact IS NULL THEN [] ELSE [u_exact] END) +
+         (CASE WHEN u_sam   IS NULL THEN [] ELSE [u_sam]   END) +
+         (CASE WHEN u_upn   IS NULL THEN [] ELSE [u_upn]   END) +
+         (CASE WHEN az_upn  IS NULL THEN [] ELSE [az_upn]  END) +
+         (CASE WHEN c       IS NULL THEN [] ELSE [c]       END) AS targets
     WITH {r:r, has:size(targets)>0} AS row
     RETURN
       [x IN collect(row) WHERE NOT x.has | x.r] AS missing,
@@ -110,119 +326,285 @@ def _pre_match(session, rows):
     found = res["found"] if res and res["found"] else []
     return found, missing
 
-def _apply_updates(session, rows, redact):
+def _apply_updates(session, rows, write_temp: bool) -> int:
+    """
+    Minimal writes:
+      - Always:
+          Patchhound_has_hash = true
+          Patchhound_has_pass = (pwd IS NOT NULL)
+      - If write_temp:
+          Patchhound_nt   = r.nt
+          Patchhound_pass = r.pwd
+    """
     q = """
     UNWIND $rows AS r
     OPTIONAL MATCH (u_exact:User {name:r.name})
-    WITH r, collect(u_exact) AS exacts
-    CALL {
-      WITH r, exacts
-      OPTIONAL MATCH (u_sam:User)
-        WHERE size(exacts)=0 AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
-      WITH r, exacts, collect(u_sam) AS sam_users
-      OPTIONAL MATCH (c:Computer)
-        WHERE size(exacts)=0 AND toUpper(coalesce(c.samaccountname,'')) = r.sam
-      WITH r, exacts, sam_users, collect(c) AS comps
-      RETURN CASE WHEN size(exacts)>0 THEN exacts ELSE sam_users + comps END AS targets
-    }
+
+    OPTIONAL MATCH (u_sam:User)
+      WHERE r.sam <> '' AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
+
+    OPTIONAL MATCH (u_upn:User)
+      WHERE r.upn <> '' AND toUpper(coalesce(u_upn.userprincipalname, u_upn.userPrincipalName, '')) = r.upn
+
+    OPTIONAL MATCH (az_upn:AZUser)
+      WHERE r.upn <> '' AND toUpper(coalesce(az_upn.userprincipalname, az_upn.userPrincipalName, '')) = r.upn
+
+    OPTIONAL MATCH (c:Computer)
+      WHERE r.sam <> '' AND toUpper(coalesce(c.samaccountname,'')) = r.sam
+
+    WITH r,
+         (CASE WHEN u_exact IS NULL THEN [] ELSE [u_exact] END) +
+         (CASE WHEN u_sam   IS NULL THEN [] ELSE [u_sam]   END) +
+         (CASE WHEN u_upn   IS NULL THEN [] ELSE [u_upn]   END) +
+         (CASE WHEN az_upn  IS NULL THEN [] ELSE [az_upn]  END) +
+         (CASE WHEN c       IS NULL THEN [] ELSE [c]       END) AS targets
     UNWIND targets AS n
-    SET n.Patchhound_has_hash = true
-    FOREACH (_ IN CASE WHEN $redact THEN [] ELSE [1] END |
-        SET n.Patchhound_nt = r.nt
-    )
-    FOREACH (_ IN CASE WHEN r.pwd IS NULL THEN [] ELSE [1] END |
-        SET n.Patchhound_cracked = true
-    )
-    FOREACH (_ IN CASE WHEN r.pwd IS NULL THEN [] ELSE [1] END |
-        SET n.owned = true,
-            n.system_tags = CASE
-                WHEN n.system_tags IS NULL THEN ['owned']
-                WHEN 'owned' IN n.system_tags THEN n.system_tags
-                ELSE n.system_tags + 'owned'
-            END
-    )
-    FOREACH (_ IN CASE WHEN r.pwd IS NULL OR $redact THEN [] ELSE [1] END |
-        SET n.Patchhound_pass = r.pwd
+    SET n.Patchhound_has_hash = true,
+        n.Patchhound_has_pass = CASE WHEN r.pwd IS NULL THEN false ELSE true END
+    FOREACH (_ IN CASE WHEN $write_temp THEN [1] ELSE [] END |
+        SET n.Patchhound_nt   = r.nt,
+            n.Patchhound_pass = r.pwd
     )
     RETURN count(DISTINCT n) AS updated
     """
-    res = session.run(q, rows=rows, redact=redact).single()
+    res = session.run(q, rows=rows, write_temp=write_temp).single()
     return res["updated"] if res and "updated" in res else 0
 
-def run_patches(driver, ctx, markers, redact=False):
-    m = markers(ctx.nocolor)
+# ----------------------------
+# Pretty printers
+# ----------------------------
+def _print_pot_stats(markers, stats, verbose: bool):
+    print(f"{markers['info']} Potfile stats:")
+    print(f"    lines_total    : {stats['lines_total']}")
+    print(f"    entries_total  : {stats['entries_total']}")
+    print(f"    valid_entries  : {stats['valid_entries']}")
+    print(f"    excluded_count : {stats['excluded_count']}")
+    print(f"    ntlm32_valid   : {stats['ntlm32_valid']}")
+    print(f"    $HEX_found     : {stats['hex_wrapped']}")
+    print(f"    $HEX_decoded   : {stats['hex_decoded']}")
+    print(f"    unique_hashes  : {stats['unique_hashes']}")
 
-    cracked = _load_potfile(ctx.potfile)
-    nt_pairs = _load_ntlm_file(ctx.ntlm_path)
+    excl = stats.get("excluded_lines", [])
+    print(f"    excluded_lines ({len(excl)}):")
+    if excl:
+        to_show = excl if EXCLUDED_PRINT_LIMIT is None else excl[:EXCLUDED_PRINT_LIMIT]
+        for line in to_show:
+            print(f"      - {line}")
+        if EXCLUDED_PRINT_LIMIT is not None and len(excl) > EXCLUDED_PRINT_LIMIT:
+            print(f"      ... ({len(excl) - EXCLUDED_PRINT_LIMIT} more)")
 
-    rows = []
-    seen = set()
-    for acct, nt in nt_pairs:
-        key = (acct.lower(), nt)
-        if key in seen:
-            continue
-        seen.add(key)
-        _, sam = _split_account(acct)
-        pwd = cracked.get(nt)
-        rows.append({
-            "name": acct,
-            "sam": (sam or "").upper(),
-            "nt": nt,
-            "pwd": pwd,
-        })
+    hex_lines = stats.get("hex_decoded_lines", [])
+    print(f"    $HEX decodes ({len(hex_lines)}):  format => nthash:HEXHASHCAT:password")
+    if hex_lines:
+        to_show = hex_lines if HEX_PRINT_LIMIT is None else hex_lines[:HEX_PRINT_LIMIT]
+        for line in to_show:
+            print(f"      {line}")
+        if HEX_PRINT_LIMIT is not None and len(hex_lines) > HEX_PRINT_LIMIT:
+            print(f"      ... ({len(hex_lines) - HEX_PRINT_LIMIT} more)")
 
-    total = len(rows)
-    if total == 0:
-        print(f"{m['ok']} Nothing to apply")
+
+def _print_nt_stats(markers, stats, verbose: bool):
+    print(f"{markers['info']} NTLM file stats:")
+    print(f"    lines_total     : {stats['lines_total']}")
+    print(f"    lines_with_hash : {stats['lines_with_hash']}")
+    print(f"    hashes_total    : {stats['hashes_total']}")
+    print(f"    unique_hashes   : {stats['unique_hashes']}")
+    print(f"    accounts_total  : {stats['accounts_total']}")
+    print(f"    pairs_total     : {stats['pairs_total']}")
+    print(f"    unique_pairs    : {stats['unique_pairs']}")
+    print(f"    valid_records   : {stats['valid_records']}")
+    print(f"    excluded_count  : {stats['excluded_count']}")
+
+    excl = stats.get("excluded_lines", [])
+    print(f"    excluded_lines ({len(excl)}):")
+    if excl:
+        to_show = excl if EXCLUDED_PRINT_LIMIT is None else excl[:EXCLUDED_PRINT_LIMIT]
+        for line in to_show:
+            print(f"      - {line}")
+        if EXCLUDED_PRINT_LIMIT is not None and len(excl) > EXCLUDED_PRINT_LIMIT:
+            print(f"      ... ({len(excl) - EXCLUDED_PRINT_LIMIT} more)")
+
+
+# ----------------------------
+# Public entrypoint (used by main script)
+# ----------------------------
+def run(args, markers=None, no_color=False) -> bool:
+    """
+    Called from main as: patch_run(args, markers=m, no_color=args.no_color)
+    """
+    nocolor = bool(no_color) if no_color is not None else bool(getattr(args, "no_color", False))
+    verbose = bool(getattr(args, "verbose", False))
+    write_temp = bool(getattr(args, "temp", False))
+    _ = bool(getattr(args, "owned", False))  # placeholder / no-op
+
+    if markers is None:
+        markers = _make_markers(nocolor)
+
+    # ---- Session / API check
+    try:
+        base_url, token = _load_session()
+    except RuntimeError as e:
+        print(f"{markers['warn']} {e}")
+        return False
+
+    url = f"{base_url.rstrip('/')}/api/version"
+    headers = {"accept": "application/json", "Prefer": "0", "Authorization": f"Bearer {token}"}
+
+    if verbose:
+        print(f"{markers['info']} Verifying token via {url}")
+        redacted_headers = dict(headers)
+        redacted_headers["Authorization"] = "Bearer " + _redact_token(token)
+        print(f"{markers['info']} Headers:\n{json.dumps(redacted_headers, indent=2)}")
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"{markers['warn']} Request failed: {e}")
+        return False
+
+    if verbose:
+        print(f"{markers['info']} Response status: {resp.status_code}")
+        try:
+            pretty = json.dumps(resp.json(), indent=2, ensure_ascii=False)
+            print(f"{markers['info']} Response JSON:\n{pretty}")
+        except ValueError:
+            print(f"{markers['info']} Response (non-JSON):\n{resp.text}")
+
+    if resp.status_code != 200:
+        print(f"{markers['warn']} {_extract_error_message(resp)}")
+        return False
+
+    if verbose:
+        print(f"{markers['info']} Using session token: {_redact_token(token)}")
+        print(f"{markers['info']} Base URL: {base_url}")
+    else:
+        print(f"{markers['ok']} JWT valid")
+
+    # ---- Inputs
+    clears = getattr(args, "clears", None)
+    ntlm = getattr(args, "ntlm", None)
+    kerberos = getattr(args, "kerberos", None)
+
+    if not clears or (not ntlm and not kerberos):
+        print(f"{markers['warn']} Usage error: --clears is required, plus at least one of --ntlm or --kerberos.")
+        return False
+
+    try:
+        _check_file(clears, "Clears file")
+        if ntlm:
+            _check_file(ntlm, "NTLM file")
+        if kerberos:
+            _check_file(kerberos, "Kerberos file")
+    except RuntimeError as e:
+        print(f"{markers['warn']} {e}")
+        return False
+
+    # ---- File stats / validity
+    pot_stats = _analyze_potfile(clears)
+    cracked_map: Dict[str, str] = pot_stats.pop("_cracked_map")
+    _print_pot_stats(markers, pot_stats, verbose)
+
+    nt_stats = {"_records": [], "lines_total": 0, "lines_with_hash": 0, "hashes_total": 0,
+                "unique_hashes": 0, "accounts_total": 0, "pairs_total": 0, "unique_pairs": 0,
+                "valid_records": 0, "excluded_count": 0, "excluded_lines": []}
+    if ntlm:
+        nt_stats = _analyze_ntlm_file(ntlm)
+        _print_nt_stats(markers, nt_stats, verbose)
+
+    if pot_stats["valid_entries"] == 0:
+        print(f"{markers['warn']} potfile appears to have no usable NTLM entries (32-hex)")
+    if ntlm and nt_stats["unique_pairs"] == 0:
+        print(f"{markers['warn']} ntlm file appears to have no valid (acct, hash) pairs")
+
+    if verbose:
+        print(f"{markers['info']} Neo4j defaults:")
+        print(f"    uri={DEFAULT_URI}")
+        print(f"    user={DEFAULT_USER}")
+        print(f"    pass={_redact_secret(DEFAULT_PASS)}")
+
+    # ---- Neo4j
+    try:
+        from neo4j import GraphDatabase
+    except Exception:
+        print(f"{markers['warn']} Neo4j driver not installed. Install with: pip install neo4j")
+        return False
+
+    driver = None
+    try:
+        driver = GraphDatabase.driver(DEFAULT_URI, auth=(DEFAULT_USER, DEFAULT_PASS))
+        with driver.session() as session:
+            _ = session.run("RETURN 1 AS ok").single()
+        print(f"{markers['ok']} Neo4j auth OK")
+
+        # Build rows (records already have uppercase SAM/UPN for case-insensitive compare)
+        records = nt_stats.get("_records", []) if ntlm else []
+
+        rows: List[Dict[str, str]] = []
+        for rec in records:
+            nt = rec["nt"]
+            pwd = cracked_map.get(nt)
+            rows.append({"name": rec["name"], "sam": rec["sam"], "upn": rec["upn"], "nt": nt, "pwd": pwd})
+
+        total = len(rows)
+        if total == 0:
+            print(f"{markers['ok']} Nothing to apply")
+            return True
+
+        if verbose:
+            print(f"{markers['info']} Applying to Neo4j: {total} candidates (write_temp={write_temp})")
+
+        applied = 0
+        done = 0
+        unmatched_all = []
+        failures = []
+
+        with driver.session() as s:
+            for i in range(0, total, BATCH_SIZE):
+                chunk = rows[i:i+BATCH_SIZE]
+                found, missing = _pre_match(s, chunk)
+
+                if missing:
+                    unmatched_all.extend(missing)
+                    done += len(missing)
+                    _progress(done, total, "Applying", nocolor)
+
+                if not found:
+                    continue
+
+                for j in range(0, len(found), APPLY_STEP):
+                    sub = found[j:j+APPLY_STEP]
+                    try:
+                        upd = _apply_updates(s, sub, write_temp)
+                        applied += upd
+                    except Exception as e:
+                        failures.append((str(e), sub))
+                    finally:
+                        done += len(sub)
+                        _progress(done, total, "Applying", nocolor)
+
+        print(f"{markers['ok']} Updated nodes: {applied}")
+        if unmatched_all:
+            print(f"{markers['warn']} Failed to map: {len(unmatched_all)}")
+            if verbose:
+                for r in unmatched_all:
+                    nm = r.get("name") or "(unknown)"
+                    sm = r.get("sam") or "(none)"
+                    up = r.get("upn") or "(none)"
+                    print(f"{markers['info']} {nm} -> no match on any of: name, SAM ({sm}), UPN ({up})")
+        if failures:
+            print(f"{markers['warn']} Write failures: {len(failures)}")
+            if verbose:
+                for msg, sub in failures:
+                    ex_count = len(sub)
+                    sample = sub[0] if sub else {}
+                    who = sample.get("name") or sample.get("sam") or sample.get("upn") or "(unknown)"
+                    print(f"{markers['info']} {ex_count} rows failed starting at {who} -> {msg}")
+
         return True
 
-    if ctx.verbose:
-        print(f"{m['info']} Applying to Neo4j: {total} candidates")
-
-    applied = 0
-    done = 0
-    unmatched_all = []
-    failures = []
-
-    with driver.session() as s:
-        for i in range(0, total, BATCH_SIZE):
-            chunk = rows[i:i+BATCH_SIZE]
-            found, missing = _pre_match(s, chunk)
-
-            if missing:
-                unmatched_all.extend(missing)
-                done += len(missing)
-                _progress(done, total, "Applying", ctx.nocolor)
-
-            if not found:
-                continue
-
-            for j in range(0, len(found), APPLY_STEP):
-                sub = found[j:j+APPLY_STEP]
-                try:
-                    upd = _apply_updates(s, sub, redact)
-                    applied += upd
-                except Exception as e:
-                    failures.append((str(e), sub))
-                finally:
-                    done += len(sub)
-                    _progress(done, total, "Applying", ctx.nocolor)
-
-    print(f"{m['ok']} Updated nodes: {applied}")
-    if unmatched_all:
-        print(f"{m['warn']} Failed to map: {len(unmatched_all)}")
-        if ctx.verbose:
-            for r in unmatched_all:
-                nm = r.get("name") or "(unknown)"
-                sm = r.get("sam") or "(none)"
-                print(f"{m['info']} {nm} -> no match on User.name or Computer.samaccountname ({sm})")
-    if failures:
-        print(f"{m['warn']} Write failures: {len(failures)}")
-        if ctx.verbose:
-            for msg, sub in failures:
-                ex_count = len(sub)
-                sample = sub[0] if sub else {}
-                who = sample.get("name") or sample.get("sam") or "(unknown)"
-                print(f"{m['info']} {ex_count} rows failed starting at {who} -> {msg}")
-
-    return True
+    finally:
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
