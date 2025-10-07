@@ -11,26 +11,19 @@ from typing import Tuple, List, Dict, Optional
 from src.conn import DEFAULT_URI, DEFAULT_USER, DEFAULT_PASS
 from src.pwetty import progress_bar
 
-# ----------------------------
-# Constants
-# ----------------------------
 SESSION_PATH = os.path.join(tempfile.gettempdir(), "patchhound.session.json")
 
 BATCH_SIZE = 1000
 APPLY_STEP = 50
+API_BATCH = 500
 
 HEX32 = re.compile(r'\b[a-fA-F0-9]{32}\b')
 HEX_WRAP = re.compile(r'^\s*\$HEX\[([0-9A-Fa-f]+)\]\s*$')
 UPN_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 
-# To avoid terminal spam on massive inputs; set to None to print all
 EXCLUDED_PRINT_LIMIT = 200
 HEX_PRINT_LIMIT = 200
 
-
-# ----------------------------
-# UI helpers
-# ----------------------------
 def _make_markers(nocolor: bool) -> Dict[str, str]:
     return {"ok": "[+]", "info": "[*]", "warn": "[!]"}
 
@@ -43,10 +36,6 @@ def _progress(done: int, total: int, prefix: str, nocolor: bool):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-
-# ----------------------------
-# Session / I/O helpers
-# ----------------------------
 def _load_session() -> Tuple[str, str]:
     if not os.path.exists(SESSION_PATH):
         raise RuntimeError("No session found — run `auth` first.")
@@ -93,14 +82,7 @@ def _check_file(path: str, what: str):
     if not os.path.isfile(path):
         raise RuntimeError(f"{what} is not a file: {path}")
 
-
-# ----------------------------
-# Potfile / NTLM parsing + stats
-# ----------------------------
 def _decode_hex_pw(pw: str) -> Tuple[str, bool, Optional[str]]:
-    """
-    Returns (decoded_text, was_hex, original_hex_token_when_present)
-    """
     m = HEX_WRAP.match(pw)
     if not m:
         return pw, False, None
@@ -115,10 +97,6 @@ def _decode_hex_pw(pw: str) -> Tuple[str, bool, Optional[str]]:
 
 
 def _analyze_potfile(path: str) -> Dict[str, object]:
-    """
-    Expected format: <32-hex-ntlm>:<password>
-    Stats include excluded lines (with reason) and HEX decodes.
-    """
     stats = {
         "lines_total": 0,
         "entries_total": 0,
@@ -198,10 +176,6 @@ def _split_account(acct: str):
 
 
 def _analyze_ntlm_file(path: str) -> Dict[str, object]:
-    """
-    Expected: at least one 32-hex hash + an account token (prefer DOMAIN\\user).
-    Captures explicit UPN tokens; if absent and DOMAIN looks FQDN, synthesizes UPN.
-    """
     stats = {
         "lines_total": 0,
         "lines_with_hash": 0,
@@ -235,7 +209,7 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
 
             tokens = [p for p in re.split(r'[:\s,;]+', s) if p]
             acct = _canonicalize_account(tokens)
-            upn = _extract_upn(tokens)  # explicit UPN token if present
+            upn = _extract_upn(tokens)
 
             if acct:
                 stats["accounts_total"] += 1
@@ -251,13 +225,11 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
                 continue
 
             dom, sam = _split_account(acct)
-
-            # Synthesize UPN from DOMAIN\sam when domain looks FQDN; keep case-insensitive downstream
             if not upn and dom and '.' in dom and sam:
                 upn = f"{sam}@{dom.lower()}"
 
             rec_sam = (sam or "").upper()
-            rec_upn = (upn or "").upper()  # normalize for case-insensitive matching
+            rec_upn = (upn or "").upper()
 
             for h in hashes:
                 h = h.lower()
@@ -265,7 +237,6 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
                 hashes_seen.add(h)
                 stats["valid_records"] += 1
 
-    # unique (acct,hash) pairs
     seen_pairs = set()
     out_records: List[Dict[str, str]] = []
     for rec in records:
@@ -281,35 +252,18 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
     stats["_records"] = out_records
     return stats
 
-
-# ----------------------------
-# Neo4j matching & updates (no fallbacks; union of all forms)
-# ----------------------------
 def _pre_match(session, rows):
-    """
-    Match across all forms at once:
-      - :User {name}
-      - :User.samaccountname
-      - :User.userprincipalname / userPrincipalName
-      - :AZUser.userprincipalname / userPrincipalName
-      - :Computer.samaccountname
-    """
     q = """
     UNWIND $rows AS r
     OPTIONAL MATCH (u_exact:User {name:r.name})
-
     OPTIONAL MATCH (u_sam:User)
       WHERE r.sam <> '' AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
-
     OPTIONAL MATCH (u_upn:User)
       WHERE r.upn <> '' AND toUpper(coalesce(u_upn.userprincipalname, u_upn.userPrincipalName, '')) = r.upn
-
     OPTIONAL MATCH (az_upn:AZUser)
       WHERE r.upn <> '' AND toUpper(coalesce(az_upn.userprincipalname, az_upn.userPrincipalName, '')) = r.upn
-
     OPTIONAL MATCH (c:Computer)
       WHERE r.sam <> '' AND toUpper(coalesce(c.samaccountname,'')) = r.sam
-
     WITH r,
          (CASE WHEN u_exact IS NULL THEN [] ELSE [u_exact] END) +
          (CASE WHEN u_sam   IS NULL THEN [] ELSE [u_sam]   END) +
@@ -326,32 +280,19 @@ def _pre_match(session, rows):
     found = res["found"] if res and res["found"] else []
     return found, missing
 
+
 def _apply_updates(session, rows, write_temp: bool) -> int:
-    """
-    Minimal writes:
-      - Always:
-          Patchhound_has_hash = true
-          Patchhound_has_pass = (pwd IS NOT NULL)
-      - If write_temp:
-          Patchhound_nt   = r.nt
-          Patchhound_pass = r.pwd
-    """
     q = """
     UNWIND $rows AS r
     OPTIONAL MATCH (u_exact:User {name:r.name})
-
     OPTIONAL MATCH (u_sam:User)
       WHERE r.sam <> '' AND toUpper(coalesce(u_sam.samaccountname,'')) = r.sam
-
     OPTIONAL MATCH (u_upn:User)
       WHERE r.upn <> '' AND toUpper(coalesce(u_upn.userprincipalname, u_upn.userPrincipalName, '')) = r.upn
-
     OPTIONAL MATCH (az_upn:AZUser)
       WHERE r.upn <> '' AND toUpper(coalesce(az_upn.userprincipalname, az_upn.userPrincipalName, '')) = r.upn
-
     OPTIONAL MATCH (c:Computer)
       WHERE r.sam <> '' AND toUpper(coalesce(c.samaccountname,'')) = r.sam
-
     WITH r,
          (CASE WHEN u_exact IS NULL THEN [] ELSE [u_exact] END) +
          (CASE WHEN u_sam   IS NULL THEN [] ELSE [u_sam]   END) +
@@ -370,10 +311,75 @@ def _apply_updates(session, rows, write_temp: bool) -> int:
     res = session.run(q, rows=rows, write_temp=write_temp).single()
     return res["updated"] if res and "updated" in res else 0
 
-# ----------------------------
-# Pretty printers
-# ----------------------------
+def _collect_owned_candidate_sids(session) -> Tuple[List[str], int, int, int]:
+    q1 = """
+    MATCH (u:User)
+    WHERE coalesce(u.Patchhound_has_pass,false) = true
+    RETURN collect(DISTINCT u.objectid) AS sids_all,
+           count(u) AS pass_users_total
+    """
+    rec1 = session.run(q1).single()
+    if not rec1:
+        return [], 0, 0, 0
+
+    sids_all = rec1["sids_all"] or []
+    pass_users_total = int(rec1["pass_users_total"] or 0)
+
+    sids = [sid for sid in sids_all if sid and str(sid).strip()]
+    pass_users_with_sid = len(sids)
+
+    if not sids:
+        return [], pass_users_total, 0, 0
+
+    q2 = """
+    UNWIND $sids AS sid
+    OPTIONAL MATCH (az:AZUser)
+      WHERE toUpper(coalesce(az.onpremisessid,
+                             az.onpremisessecurityidentifier,
+                             az.onPremisesSecurityIdentifier,
+                             az.onPremSid,
+                             az.onprem_sid, '')) = toUpper(sid)
+    WITH sid, count(az) AS hits
+    RETURN count(CASE WHEN hits > 0 THEN 1 END) AS sids_with_az
+    """
+    rec2 = session.run(q2, sids=sids).single()
+    sids_with_az = int(rec2["sids_with_az"] or 0) if rec2 else 0
+
+    return sids, pass_users_total, pass_users_with_sid, sids_with_az
+
+def _append_owned_selectors(base_url: str, token: str, asset_group_id: int, sids: List[str], markers, verbose: bool):
+    if not sids:
+        print(f"{markers['info']} Owned API: no SIDs to add")
+        return
+
+    url = f"{base_url.rstrip('/')}/api/v2/asset-groups/{asset_group_id}/selectors"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    total = len(sids)
+    done = 0
+    for i in range(0, total, API_BATCH):
+        batch = sids[i:i + API_BATCH]
+        payload = [{"selector_name": "Manual", "sid": sid, "action": "add"} for sid in batch]
+        try:
+            resp = requests.put(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            body = None
+            try:
+                body = resp.text
+            except Exception:
+                body = str(e)
+            print(f"{markers['warn']} Owned API batch failed ({i+1}-{i+len(batch)}): {body}")
+        done += len(batch)
+        _progress(done, total, "Owned API", False)
+
+    print(f"{markers['ok']} Owned API: attempted {total} selector adds")
+
 def _print_pot_stats(markers, stats, verbose: bool):
+    if not verbose:
+        print(f"{markers['ok']} Potfile Check")
+        return
+
     print(f"{markers['info']} Potfile stats:")
     print(f"    lines_total    : {stats['lines_total']}")
     print(f"    entries_total  : {stats['entries_total']}")
@@ -402,8 +408,11 @@ def _print_pot_stats(markers, stats, verbose: bool):
         if HEX_PRINT_LIMIT is not None and len(hex_lines) > HEX_PRINT_LIMIT:
             print(f"      ... ({len(hex_lines) - HEX_PRINT_LIMIT} more)")
 
-
 def _print_nt_stats(markers, stats, verbose: bool):
+    if not verbose:
+        print(f"{markers['ok']} NTLM Check")
+        return
+
     print(f"{markers['info']} NTLM file stats:")
     print(f"    lines_total     : {stats['lines_total']}")
     print(f"    lines_with_hash : {stats['lines_with_hash']}")
@@ -424,23 +433,15 @@ def _print_nt_stats(markers, stats, verbose: bool):
         if EXCLUDED_PRINT_LIMIT is not None and len(excl) > EXCLUDED_PRINT_LIMIT:
             print(f"      ... ({len(excl) - EXCLUDED_PRINT_LIMIT} more)")
 
-
-# ----------------------------
-# Public entrypoint (used by main script)
-# ----------------------------
 def run(args, markers=None, no_color=False) -> bool:
-    """
-    Called from main as: patch_run(args, markers=m, no_color=args.no_color)
-    """
     nocolor = bool(no_color) if no_color is not None else bool(getattr(args, "no_color", False))
     verbose = bool(getattr(args, "verbose", False))
     write_temp = bool(getattr(args, "temp", False))
-    _ = bool(getattr(args, "owned", False))  # placeholder / no-op
+    do_owned = bool(getattr(args, "owned", False))
 
     if markers is None:
         markers = _make_markers(nocolor)
 
-    # ---- Session / API check
     try:
         base_url, token = _load_session()
     except RuntimeError as e:
@@ -480,7 +481,6 @@ def run(args, markers=None, no_color=False) -> bool:
     else:
         print(f"{markers['ok']} JWT valid")
 
-    # ---- Inputs
     clears = getattr(args, "clears", None)
     ntlm = getattr(args, "ntlm", None)
     kerberos = getattr(args, "kerberos", None)
@@ -499,7 +499,6 @@ def run(args, markers=None, no_color=False) -> bool:
         print(f"{markers['warn']} {e}")
         return False
 
-    # ---- File stats / validity
     pot_stats = _analyze_potfile(clears)
     cracked_map: Dict[str, str] = pot_stats.pop("_cracked_map")
     _print_pot_stats(markers, pot_stats, verbose)
@@ -522,7 +521,6 @@ def run(args, markers=None, no_color=False) -> bool:
         print(f"    user={DEFAULT_USER}")
         print(f"    pass={_redact_secret(DEFAULT_PASS)}")
 
-    # ---- Neo4j
     try:
         from neo4j import GraphDatabase
     except Exception:
@@ -536,7 +534,6 @@ def run(args, markers=None, no_color=False) -> bool:
             _ = session.run("RETURN 1 AS ok").single()
         print(f"{markers['ok']} Neo4j auth OK")
 
-        # Build rows (records already have uppercase SAM/UPN for case-insensitive compare)
         records = nt_stats.get("_records", []) if ntlm else []
 
         rows: List[Dict[str, str]] = []
@@ -548,57 +545,91 @@ def run(args, markers=None, no_color=False) -> bool:
         total = len(rows)
         if total == 0:
             print(f"{markers['ok']} Nothing to apply")
-            return True
+        else:
+            if verbose:
+                print(f"{markers['info']} Applying to Neo4j: {total} candidates (write_temp={write_temp})")
 
-        if verbose:
-            print(f"{markers['info']} Applying to Neo4j: {total} candidates (write_temp={write_temp})")
+            applied = 0
+            done = 0
+            unmatched_all = []
+            failures = []
 
-        applied = 0
-        done = 0
-        unmatched_all = []
-        failures = []
+            print(f"{markers['ok']} Waiting for Neo4j")
 
-        with driver.session() as s:
-            for i in range(0, total, BATCH_SIZE):
-                chunk = rows[i:i+BATCH_SIZE]
-                found, missing = _pre_match(s, chunk)
+            with driver.session() as s:
+                for i in range(0, total, BATCH_SIZE):
+                    chunk = rows[i:i+BATCH_SIZE]
+                    found, missing = _pre_match(s, chunk)
 
-                if missing:
-                    unmatched_all.extend(missing)
-                    done += len(missing)
-                    _progress(done, total, "Applying", nocolor)
-
-                if not found:
-                    continue
-
-                for j in range(0, len(found), APPLY_STEP):
-                    sub = found[j:j+APPLY_STEP]
-                    try:
-                        upd = _apply_updates(s, sub, write_temp)
-                        applied += upd
-                    except Exception as e:
-                        failures.append((str(e), sub))
-                    finally:
-                        done += len(sub)
+                    if missing:
+                        unmatched_all.extend(missing)
+                        done += len(missing)
                         _progress(done, total, "Applying", nocolor)
 
-        print(f"{markers['ok']} Updated nodes: {applied}")
-        if unmatched_all:
-            print(f"{markers['warn']} Failed to map: {len(unmatched_all)}")
+                    if not found:
+                        continue
+
+                    for j in range(0, len(found), APPLY_STEP):
+                        sub = found[j:j+APPLY_STEP]
+                        try:
+                            upd = _apply_updates(s, sub, write_temp)
+                            applied += upd
+                        except Exception as e:
+                            failures.append((str(e), sub))
+                        finally:
+                            done += len(sub)
+                            _progress(done, total, "Applying", nocolor)
+
+            print(f"{markers['ok']} Updated nodes: {applied}")
+            if unmatched_all:
+                print(f"{markers['warn']} Failed to map: {len(unmatched_all)}")
+                if verbose:
+                    for r in unmatched_all:
+                        nm = r.get("name") or "(unknown)"
+                        sm = r.get("sam") or "(none)"
+                        up = r.get("upn") or "(none)"
+                        print(f"{markers['info']} {nm} -> no match on name, SAM ({sm}), or UPN ({up})")
+            if failures:
+                print(f"{markers['warn']} Write failures: {len(failures)}")
+                if verbose:
+                    for msg, sub in failures:
+                        ex_count = len(sub)
+                        sample = sub[0] if sub else {}
+                        who = sample.get("name") or sample.get("sam") or sample.get("upn") or "(unknown)"
+                        print(f"{markers['info']} {ex_count} rows failed starting at {who} -> {msg}")
+
+        if do_owned:
+            print(f"{markers['ok']} Waiting for Neo4j and API")
+
+            with driver.session() as s:
+                sids, pass_total, pass_with_sid, sids_with_az = _collect_owned_candidate_sids(s)
+
+            agid = getattr(args, "asset_group_id", None)
+            if agid is None:
+                agid = int(os.getenv("PATCHHOUND_ASSET_GROUP_ID", "2"))
+            else:
+                agid = int(agid)
+
+            _append_owned_selectors(base_url, token, agid, sids, markers, verbose)
+
+            # final summary (verbose only)
             if verbose:
-                for r in unmatched_all:
-                    nm = r.get("name") or "(unknown)"
-                    sm = r.get("sam") or "(none)"
-                    up = r.get("upn") or "(none)"
-                    print(f"{markers['info']} {nm} -> no match on any of: name, SAM ({sm}), UPN ({up})")
-        if failures:
-            print(f"{markers['warn']} Write failures: {len(failures)}")
-            if verbose:
-                for msg, sub in failures:
-                    ex_count = len(sub)
-                    sample = sub[0] if sub else {}
-                    who = sample.get("name") or sample.get("sam") or sample.get("upn") or "(unknown)"
-                    print(f"{markers['info']} {ex_count} rows failed starting at {who} -> {msg}")
+                ex_sid = sids[0] if sids else None
+                print(f"{markers['info']} Owned summary:")
+                print(f"    users_with_password_true  : {pass_total}")
+                print(f"    with_sid                  : {pass_with_sid}")
+                print(f"    distinct_sids_sent        : {len(sids)}")
+                print(f"    sids_with_azuser_link     : {sids_with_az}")
+                print(f"    asset_group_id            : {agid}")
+                if ex_sid:
+                    ex_url = f"{base_url.rstrip('/')}/api/v2/asset-groups/{agid}/selectors"
+                    example_payload = [{"selector_name": "Manual", "sid": ex_sid, "action": "add"}]
+                    print(f"    example_request:")
+                    print(f"      PUT {ex_url}")
+                    print(f"      payload: {json.dumps(example_payload)}")
+
+            else:
+                print(f"{markers['ok']} Owned Check")
 
         return True
 
