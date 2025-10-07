@@ -624,7 +624,7 @@ def run(args, markers=None, no_color=False) -> bool:
                 if ex_sid:
                     ex_url = f"{base_url.rstrip('/')}/api/v2/asset-groups/{agid}/selectors"
                     example_payload = [{"selector_name": "Manual", "sid": ex_sid, "action": "add"}]
-                    print(f"    example_request:")
+                    print("    example_request:")
                     print(f"      PUT {ex_url}")
                     print(f"      payload: {json.dumps(example_payload)}")
 
