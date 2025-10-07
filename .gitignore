@@ -11,5 +11,6 @@ uv.lock
 *.pot
 *.potfile
 *.dmp
+*.json
 dumps/
 notes/

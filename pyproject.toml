@@ -1,5 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "patchhound"
 version = "0.1.0"
-requires-python = ">=3.10"
-dependencies = ["neo4j>=5.0"]
+description = "PatchHound - BloodHound credential import & ownership tagging tool"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "A3-N" }]
+
+dependencies = [
+  "requests>=2.32.0",
+  "neo4j>=5.0",
+]
+
+[project.scripts]
+patchhound = "PatchHound:main"
+
+[project.urls]
+Homepage = "https://github.com/A3-N/PatchHound"
+Issues = "https://github.com/A3-N/PatchHound/issues"
+

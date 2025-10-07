@@ -84,3 +84,7 @@ python3 PatchHound.py audit -c crack.potfile -n ntds.txt --stats \
 - **Password length distribution** – weighted by reuse count.
 
 ---
+
+### ^^^
+
+Above is old readme, still need to update it, moved over to more API than direct neo4j insertions. 
