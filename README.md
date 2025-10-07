@@ -1,6 +1,6 @@
 # PatchHound
 
-Credential signal importer + “Owned” tagging helper for **BloodHound Community Edition (CE)**.
+Credential importer + “Owned” tagging for **BloodHound Community Edition (CE)**.
 
 > Inspired by [knavesec/Max](https://github.com/knavesec/Max)
 
@@ -10,21 +10,22 @@ Credential signal importer + “Owned” tagging helper for **BloodHound Communi
 
 ## TL;DR
 
-- **auth** — log in to BloodHound CE and cache a JWT (used by other commands).
-- **patch** — read a **potfile** (cracked creds) + **NTLM file**, parse, stats, and update graph nodes in Neo4j _minimally_.  
+- **auth** — log in to BloodHound CE and cache a JWT (used by other commands for API).
+- **patch** — read a **potfile** (cracked creds) + **NTLM file**, parse, stats, and update graph nodes in Neo4j.  
   - Always sets:
     - `Patchhound_has_hash` **(bool)**
     - `Patchhound_has_pass` **(bool)** – true when a cracked password is known
-  - With `-t/--temp` **also** writes (temporary convenience values):
+  - With `-t/--temp` **also** writes (temporary values):
     - `Patchhound_nt`  – NTLM hash
     - `Patchhound_pass` – plaintext password  
     _These two are expected to be ephemeral; BloodHound CE does not persist custom node props across container restarts by default._
-  - With `-o/--owned` **after** patching, discover eligible SIDs via **Neo4j** and then **append** “Owned” selectors via the BloodHound **v2 HTTP API** (defaults to asset group id **2**).  
+  - With `-o/--owned` **after** patching, discover eligible SIDs via **Neo4j** and then **append** “Owned” selectors via the BloodHound **v2 HTTP API**.  
     - Lookups (who to own) happen **only in Neo4j**; the API is used **only** to append the Owned selectors.
 
-- **search** (optional helper) — lightweight BHCE search (if present in your tree).
+- **search** (optional helper) — lightweight BHCE search.
 
-Colors can be disabled with `--no-color` (or `--nocolor` in older examples). Verbose output via `-v`.
+Colors can be disabled with `--no-color`. 
+Verbose output via `-v`, I love verbose, can't miss an import.
 
 ![screenshot](img/5.png)
 
@@ -36,8 +37,8 @@ Colors can be disabled with `--no-color` (or `--nocolor` in older examples). Ver
 - **Temporary writes with `-t`:** add `Patchhound_nt` and `Patchhound_pass`.
 - **“Owned” via API with `-o`:**  
   - Query Neo4j for `:User` nodes where `Patchhound_has_pass = true` and a non-empty SID (`objectid`).  
-  - Also note which of those SIDs have a linked `:AZUser` with the same **on‑prem SID** (several common property names supported).  
-  - Append those SIDs to an **asset group** using `PUT /api/v2/asset-groups/{id}/selectors` (default group id `2`, override with env `PATCHHOUND_ASSET_GROUP_ID` or `--asset-group-id` if you add that flag).
+  - Also note which of those SIDs have a linked `:AZUser` with the same **on‑prem SID**.  
+  - Append those SIDs to an **asset group** using `PUT /api/v2/asset-groups/{id}/selectors`.
 - **Better identity matching (no fallbacks; union of all paths):**  
   - `:User {name}` (e.g., `DOM\sam`)  
   - `:User.samaccountname`  
@@ -72,21 +73,18 @@ Adjust there or wire flags as you prefer.
 ### Help
 ```bash
 python3 PatchHound.py --help
+python3 PatchHound.py [--no-color] [subcommand] -h
 ```
 
 ### 1) Authenticate (stores JWT for other commands)
 ```bash
-python3 PatchHound.py auth   -u http://localhost:8080/   -U admin   -p 'bloodhoundcommunityedition'   [-v]
+python3 PatchHound.py auth -u http://localhost:8080/ -U admin -p 'Exclude -p for PassPrompt' [-v]
 ```
 - Writes a session file at: `${TMPDIR}/patchhound.session.json`
-- Example non-verbose output:
-```
-[+] JWT valid
-```
 
 ### 2) Patch (parse files, set minimal flags; optional temp writes)
 ```bash
-python3 PatchHound.py patch   -c crack.potfile   -n ntds.txt   [-k kerberos.txt]   [-t] [-o] [--asset-group-id 2]   [--no-color] [-v]
+python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
 ```
 
 **What it reads**
@@ -126,7 +124,7 @@ python3 PatchHound.py patch   -c crack.potfile   -n ntds.txt   [-k kerberos.txt]
   [+] NTLM Check
   [+] Neo4j auth OK
   [+] Waiting for Neo4j
-  Applying [█████░░░░░░░░░░░░░░░░░░░░░] 750/14598 (5%)
+  Applying [████████████████████████████] 14598/14598 (100%)
   [+] Updated nodes: 1234
   ```
 - Verbose also prints pretty stats, decoded HEX, and excluded input lines.
@@ -156,12 +154,7 @@ python3 PatchHound.py patch   -c crack.potfile   -n ntds.txt   [-k kerberos.txt]
         PUT http://localhost:8080/api/v2/asset-groups/2/selectors
         payload: [{"selector_name":"Manual","sid":"S-1-5-21-...","action":"add"}]
   ```
-
-**Configuration**
-- Default asset group id: **2**  
-  - Override with environment: `PATCHHOUND_ASSET_GROUP_ID=7`  
-  - Or add a CLI flag to your parser: `--asset-group-id 7`
-
+  
 ---
 
 ## Flags (current)
@@ -171,10 +164,8 @@ python3 PatchHound.py patch   -c crack.potfile   -n ntds.txt   [-k kerberos.txt]
 - `patch`:
   - `-c, --clears` — path to potfile (**required**)
   - `-n, --ntlm` — path to NTLM hash file (recommended)
-  - `-k, --kerberos` — (accepted, currently unused)
   - `-t, --temp` — write `Patchhound_nt` and `Patchhound_pass`
   - `-o, --owned` — append “Owned” selectors via API based on Neo4j discovery
-  - `--asset-group-id` — optional, override asset group id (otherwise env or default 2)
 - `auth`:
   - `-u, --url`
   - `-U, --username`
