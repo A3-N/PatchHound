@@ -19,18 +19,41 @@ def build_parser():
     p_auth.add_argument("-p", "--password", help="Password (if not set, you will be prompted securely)")
     p_auth.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for this command only")
 
-    p_patch = subparsers.add_parser("patch", help="Validate inputs and prepare to patch graph data using JWT & Neo4j defaults", formatter_class=argparse.RawTextHelpFormatter)
+    p_patch = subparsers.add_parser("patch", help="Validate inputs and prepare to patch graph data using JWT & Neo4j", formatter_class=argparse.RawTextHelpFormatter)
     p_patch.add_argument("-c", "--clears", required=True, help="Path to cleartext credentials file (required)")
-    p_patch.add_argument("-n", "--ntlm", help="Path to NTLM hashes file")
-    p_patch.add_argument("-k", "--kerberos", help="Path to Kerberos credential file")
+    p_patch.add_argument("-n", "--ntlm", required=True, help="Path to NTLM hashes file (required)")
     p_patch.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for this command only")
     p_patch.add_argument("-t", "--temp", action="store_true", default=False, help="Also write Patchhound_nt and Patchhound_pass")
-    p_patch.add_argument("-o", "--owned", action="store_true", default=False, help="(placeholder) no-op")
+    p_patch.add_argument("-o", "--owned", action="store_true", default=False, help="Append \"Owned\" selectors via API based on Neo4j discovery")
+    p_patch.add_argument("--db-uri", help="Neo4j URI (overrides src/conn.py DEFAULT_URI)")
+    p_patch.add_argument("--db-user", help="Neo4j user (overrides src/conn.py DEFAULT_USER)")
+    p_patch.add_argument("--db-pass", help="Neo4j password (overrides src/conn.py DEFAULT_PASS)")
 
-    return parser
+    return parser, p_auth, p_patch
 
 def main():
-    parser = build_parser()
+    parser, p_auth, p_patch = build_parser()
+
+    # Intercept empty runs to print comprehensive help
+    if len(sys.argv) == 1:
+        print(pwetty.ASCII_ART)
+        print()
+        parser.print_help()
+        print("\n")
+        p_auth.print_help()
+        print("\n")
+        p_patch.print_help()
+        sys.exit(0)
+
+    # Intercept subcommand runs missing all required arguments to just print help instead of erroring
+    if len(sys.argv) == 2:
+        if sys.argv[1] == "auth":
+            p_auth.print_help()
+            sys.exit(0)
+        elif sys.argv[1] == "patch":
+            p_patch.print_help()
+            sys.exit(0)
+
     args = parser.parse_args()
 
     if not args.no_color:
