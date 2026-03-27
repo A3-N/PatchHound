@@ -22,8 +22,6 @@ Credential importer + “Owned” tagging for **BloodHound Community Edition (CE
   - With `-o/--owned` **after** patching, discover eligible SIDs via **Neo4j** and then **append** “Owned” selectors via the BloodHound **v2 HTTP API**.  
     - Lookups (who to own) happen **only in Neo4j**; the API is used **only** to append the Owned selectors.
 
-- **search** (optional helper) — lightweight BHCE search.
-
 Colors can be disabled with `--no-color`. 
 Verbose output via `-v`, I love verbose, can't miss an import.
 
@@ -64,7 +62,7 @@ Defaults live in **`src/conn.py`**:
 - `DEFAULT_USER`
 - `DEFAULT_PASS`  (BH CE default is `bloodhoundcommunityedition`)
 
-Adjust there or wire flags as you prefer.
+You can override these defaults directly via the CLI flags `--db-uri`, `--db-user`, and `--db-pass`.
 
 ---
 
@@ -163,9 +161,10 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
 - `--no-color` — disable colored/ASCII output
 - `patch`:
   - `-c, --clears` — path to potfile (**required**)
-  - `-n, --ntlm` — path to NTLM hash file (recommended)
+  - `-n, --ntlm` — path to NTLM hash file (**required**)
   - `-t, --temp` — write `Patchhound_nt` and `Patchhound_pass`
   - `-o, --owned` — append “Owned” selectors via API based on Neo4j discovery
+  - `--db-uri`, `--db-user`, `--db-pass` — override Neo4j connection defaults
 - `auth`:
   - `-u, --url`
   - `-U, --username`

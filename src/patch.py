@@ -483,18 +483,10 @@ def run(args, markers=None, no_color=False) -> bool:
 
     clears = getattr(args, "clears", None)
     ntlm = getattr(args, "ntlm", None)
-    kerberos = getattr(args, "kerberos", None)
-
-    if not clears or (not ntlm and not kerberos):
-        print(f"{markers['warn']} Usage error: --clears is required, plus at least one of --ntlm or --kerberos.")
-        return False
 
     try:
         _check_file(clears, "Clears file")
-        if ntlm:
-            _check_file(ntlm, "NTLM file")
-        if kerberos:
-            _check_file(kerberos, "Kerberos file")
+        _check_file(ntlm, "NTLM file")
     except RuntimeError as e:
         print(f"{markers['warn']} {e}")
         return False
@@ -503,23 +495,23 @@ def run(args, markers=None, no_color=False) -> bool:
     cracked_map: Dict[str, str] = pot_stats.pop("_cracked_map")
     _print_pot_stats(markers, pot_stats, verbose)
 
-    nt_stats = {"_records": [], "lines_total": 0, "lines_with_hash": 0, "hashes_total": 0,
-                "unique_hashes": 0, "accounts_total": 0, "pairs_total": 0, "unique_pairs": 0,
-                "valid_records": 0, "excluded_count": 0, "excluded_lines": []}
-    if ntlm:
-        nt_stats = _analyze_ntlm_file(ntlm)
-        _print_nt_stats(markers, nt_stats, verbose)
+    nt_stats = _analyze_ntlm_file(ntlm)
+    _print_nt_stats(markers, nt_stats, verbose)
 
     if pot_stats["valid_entries"] == 0:
         print(f"{markers['warn']} potfile appears to have no usable NTLM entries (32-hex)")
-    if ntlm and nt_stats["unique_pairs"] == 0:
+    if nt_stats["unique_pairs"] == 0:
         print(f"{markers['warn']} ntlm file appears to have no valid (acct, hash) pairs")
 
+    db_uri = getattr(args, "db_uri", None) or DEFAULT_URI
+    db_user = getattr(args, "db_user", None) or DEFAULT_USER
+    db_pass = getattr(args, "db_pass", None) or DEFAULT_PASS
+
     if verbose:
-        print(f"{markers['info']} Neo4j defaults:")
-        print(f"    uri={DEFAULT_URI}")
-        print(f"    user={DEFAULT_USER}")
-        print(f"    pass={_redact_secret(DEFAULT_PASS)}")
+        print(f"{markers['info']} Neo4j connection:")
+        print(f"    uri={db_uri}")
+        print(f"    user={db_user}")
+        print(f"    pass={_redact_secret(db_pass)}")
 
     try:
         from neo4j import GraphDatabase
@@ -529,12 +521,12 @@ def run(args, markers=None, no_color=False) -> bool:
 
     driver = None
     try:
-        driver = GraphDatabase.driver(DEFAULT_URI, auth=(DEFAULT_USER, DEFAULT_PASS))
+        driver = GraphDatabase.driver(db_uri, auth=(db_user, db_pass))
         with driver.session() as session:
             _ = session.run("RETURN 1 AS ok").single()
         print(f"{markers['ok']} Neo4j auth OK")
 
-        records = nt_stats.get("_records", []) if ntlm else []
+        records = nt_stats.get("_records", [])
 
         rows: List[Dict[str, str]] = []
         for rec in records:
