@@ -449,7 +449,7 @@ def run(args, markers=None, no_color=False) -> bool:
         return False
 
     url = f"{base_url.rstrip('/')}/api/version"
-    headers = {"accept": "application/json", "Prefer": "0", "Authorization": f"Bearer {token}"}
+    headers = {"accept": "application/json", "Prefer": "wait=0", "Authorization": f"Bearer {token}"}
 
     if verbose:
         print(f"{markers['info']} Verifying token via {url}")
@@ -464,7 +464,8 @@ def run(args, markers=None, no_color=False) -> bool:
         return False
 
     if verbose:
-        print(f"{markers['info']} Response status: {resp.status_code}")
+        status_marker = markers['ok'] if resp.status_code < 400 else markers['warn']
+        print(f"{status_marker} Response status: {resp.status_code}")
         try:
             pretty = json.dumps(resp.json(), indent=2, ensure_ascii=False)
             print(f"{markers['info']} Response JSON:\n{pretty}")
