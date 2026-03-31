@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import json
+import time
 import tempfile
 import requests
 from typing import Tuple, List, Dict, Optional
@@ -301,35 +302,49 @@ def _apply_updates(session, rows, write_temp: bool) -> int:
          (CASE WHEN c       IS NULL THEN [] ELSE [c]       END) AS targets
     UNWIND targets AS n
     SET n.Patchhound_has_hash = true,
-        n.Patchhound_has_pass = CASE WHEN r.pwd IS NULL THEN false ELSE true END
+        n.Patchhound_has_pass = CASE
+            WHEN r.pwd IS NOT NULL THEN true
+            ELSE coalesce(n.Patchhound_has_pass, false)
+        END
     FOREACH (_ IN CASE WHEN $write_temp THEN [1] ELSE [] END |
-        SET n.Patchhound_nt   = r.nt,
-            n.Patchhound_pass = r.pwd
+        SET n.Patchhound_nt = CASE
+                WHEN r.pwd IS NOT NULL THEN r.nt
+                ELSE coalesce(n.Patchhound_nt, r.nt)
+            END,
+            n.Patchhound_pass = CASE
+                WHEN r.pwd IS NOT NULL THEN r.pwd
+                ELSE coalesce(n.Patchhound_pass, r.pwd)
+            END
     )
     RETURN count(DISTINCT n) AS updated
     """
     res = session.run(q, rows=rows, write_temp=write_temp).single()
     return res["updated"] if res and "updated" in res else 0
 
-def _collect_owned_candidate_sids(session) -> Tuple[List[str], int, int, int]:
+def _collect_owned_candidate_sids(session) -> Tuple[List[Dict[str, str]], int, int, int]:
+    """Return owned candidates as [{sid, name}, ...] plus stats."""
     q1 = """
     MATCH (u:User)
     WHERE coalesce(u.Patchhound_has_pass,false) = true
-    RETURN collect(DISTINCT u.objectid) AS sids_all,
-           count(u) AS pass_users_total
+    WITH DISTINCT u.objectid AS sid, u.name AS name
+    WHERE sid IS NOT NULL AND sid <> ''
+    RETURN collect({sid: sid, name: coalesce(name, sid)}) AS entries,
+           count(*) AS pass_users_total
     """
     rec1 = session.run(q1).single()
     if not rec1:
         return [], 0, 0, 0
 
-    sids_all = rec1["sids_all"] or []
+    entries = rec1["entries"] or []
     pass_users_total = int(rec1["pass_users_total"] or 0)
 
-    sids = [sid for sid in sids_all if sid and str(sid).strip()]
-    pass_users_with_sid = len(sids)
+    candidates = [e for e in entries if e.get("sid") and str(e["sid"]).strip()]
+    pass_users_with_sid = len(candidates)
 
-    if not sids:
+    if not candidates:
         return [], pass_users_total, 0, 0
+
+    sids = [e["sid"] for e in candidates]
 
     q2 = """
     UNWIND $sids AS sid
@@ -345,33 +360,57 @@ def _collect_owned_candidate_sids(session) -> Tuple[List[str], int, int, int]:
     rec2 = session.run(q2, sids=sids).single()
     sids_with_az = int(rec2["sids_with_az"] or 0) if rec2 else 0
 
-    return sids, pass_users_total, pass_users_with_sid, sids_with_az
+    return candidates, pass_users_total, pass_users_with_sid, sids_with_az
 
-def _append_owned_selectors(base_url: str, token: str, asset_group_id: int, sids: List[str], markers, verbose: bool):
-    if not sids:
+def _append_owned_selectors(base_url: str, token: str, tag_id: int,
+                            candidates: List[Dict[str, str]], markers, verbose: bool):
+    """Create selectors on the Owned asset-group-tag via the BHCE API.
+
+    Matches the exact call the BHCE UI makes for 'Add to Owned':
+        POST /api/v2/asset-group-tags/{tag_id}/selectors
+        {"name": "<display_name>", "seeds": [{"type": 1, "value": "<SID>"}]}
+    """
+    if not candidates:
         print(f"{markers['info']} Owned API: no SIDs to add")
         return
 
-    url = f"{base_url.rstrip('/')}/api/v2/asset-groups/{asset_group_id}/selectors"
+    url = f"{base_url.rstrip('/')}/api/v2/asset-group-tags/{tag_id}/selectors"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    total = len(sids)
+    total = len(candidates)
     done = 0
-    for i in range(0, total, API_BATCH):
-        batch = sids[i:i + API_BATCH]
-        payload = [{"selector_name": "Manual", "sid": sid, "action": "add"} for sid in batch]
-        try:
-            resp = requests.put(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            body = None
+    rate_delay = 0.05  # 50ms between requests to stay under rate limits
+    for entry in candidates:
+        sid = entry["sid"]
+        name = entry.get("name") or sid.replace("-", "_")
+        # Sanitize name: BHCE only allows alphanumeric, underscores, spaces
+        safe_name = re.sub(r'[^A-Za-z0-9_ ]', '_', name)
+        payload = {
+            "name": safe_name,
+            "seeds": [{"type": 1, "value": sid}],
+        }
+
+        # Retry with backoff on 429 (rate limit)
+        for attempt in range(5):
             try:
-                body = resp.text
-            except Exception:
-                body = str(e)
-            print(f"{markers['warn']} Owned API batch failed ({i+1}-{i+len(batch)}): {body}")
-        done += len(batch)
+                resp = requests.post(url, headers=headers, json=payload, timeout=30)
+                if resp.status_code == 409:
+                    break  # already exists, success
+                elif resp.status_code == 429:
+                    wait = min(2 ** attempt, 16)
+                    time.sleep(wait)
+                    continue  # retry
+                elif resp.status_code >= 400:
+                    body = _extract_error_message(resp)
+                    print(f"\n{markers['warn']} Owned API ({resp.status_code}) for {safe_name}: {body}")
+                break  # success or non-retryable error
+            except requests.RequestException as e:
+                print(f"\n{markers['warn']} Owned API failed for {safe_name}: {e}")
+                break
+
+        done += 1
         _progress(done, total, "Owned API", False)
+        time.sleep(rate_delay)
 
     print(f"{markers['ok']} Owned API: attempted {total} selector adds")
 
@@ -529,11 +568,25 @@ def run(args, markers=None, no_color=False) -> bool:
 
         records = nt_stats.get("_records", [])
 
-        rows: List[Dict[str, str]] = []
+        raw_rows: List[Dict[str, str]] = []
         for rec in records:
             nt = rec["nt"]
             pwd = cracked_map.get(nt)
-            rows.append({"name": rec["name"], "sam": rec["sam"], "upn": rec["upn"], "nt": nt, "pwd": pwd})
+            raw_rows.append({"name": rec["name"], "sam": rec["sam"], "upn": rec["upn"], "nt": nt, "pwd": pwd})
+
+        # Merge rows by account: prefer the row that has a cracked password.
+        # This prevents an uncracked hash (e.g. the LM hash from secretsdump
+        # output like  user:RID:LM_HASH:NT_HASH:::)  from overwriting the
+        # cracked NT hash entry for the same account.
+        merged: Dict[str, Dict[str, str]] = {}
+        for row in raw_rows:
+            key = row["name"].lower()
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = row
+            elif row["pwd"] is not None and existing["pwd"] is None:
+                merged[key] = row
+        rows = list(merged.values())
 
         total = len(rows)
         if total == 0:
@@ -595,30 +648,32 @@ def run(args, markers=None, no_color=False) -> bool:
             print(f"{markers['ok']} Waiting for Neo4j and API")
 
             with driver.session() as s:
-                sids, pass_total, pass_with_sid, sids_with_az = _collect_owned_candidate_sids(s)
+                candidates, pass_total, pass_with_sid, sids_with_az = _collect_owned_candidate_sids(s)
 
-            agid = getattr(args, "asset_group_id", None)
-            if agid is None:
-                agid = int(os.getenv("PATCHHOUND_ASSET_GROUP_ID", "2"))
+            tag_id = getattr(args, "asset_group_tag_id", None)
+            if tag_id is None:
+                tag_id = int(os.getenv("PATCHHOUND_ASSET_GROUP_TAG_ID",
+                             os.getenv("PATCHHOUND_ASSET_GROUP_ID", "2")))
             else:
-                agid = int(agid)
+                tag_id = int(tag_id)
 
-            _append_owned_selectors(base_url, token, agid, sids, markers, verbose)
+            _append_owned_selectors(base_url, token, tag_id, candidates, markers, verbose)
 
             # final summary (verbose only)
             if verbose:
-                ex_sid = sids[0] if sids else None
+                ex = candidates[0] if candidates else None
                 print(f"{markers['info']} Owned summary:")
                 print(f"    users_with_password_true  : {pass_total}")
                 print(f"    with_sid                  : {pass_with_sid}")
-                print(f"    distinct_sids_sent        : {len(sids)}")
+                print(f"    distinct_sids_sent        : {len(candidates)}")
                 print(f"    sids_with_azuser_link     : {sids_with_az}")
-                print(f"    asset_group_id            : {agid}")
-                if ex_sid:
-                    ex_url = f"{base_url.rstrip('/')}/api/v2/asset-groups/{agid}/selectors"
-                    example_payload = [{"selector_name": "Manual", "sid": ex_sid, "action": "add"}]
+                print(f"    asset_group_tag_id        : {tag_id}")
+                if ex:
+                    safe_name = re.sub(r'[^A-Za-z0-9_ ]', '_', ex.get('name', ex['sid']))
+                    ex_url = f"{base_url.rstrip('/')}/api/v2/asset-group-tags/{tag_id}/selectors"
+                    example_payload = {"name": safe_name, "seeds": [{"type": 1, "value": ex['sid']}]}
                     print("    example_request:")
-                    print(f"      PUT {ex_url}")
+                    print(f"      POST {ex_url}")
                     print(f"      payload: {json.dumps(example_payload)}")
 
             else:
