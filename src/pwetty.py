@@ -12,7 +12,7 @@ ASCII_ART = r"""
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
-CYAN = "\033[36m"
+BLUE = "\033[34m"
 RESET = "\033[0m"
 
 def paint(text: str, color: str, nocolor: bool = False) -> str:
@@ -23,7 +23,7 @@ def markers(nocolor: bool = False) -> dict:
     return {
         "ok": paint("[+]", GREEN, nocolor),
         "warn": paint("[!]", YELLOW, nocolor),
-        "info": paint("[*]", CYAN, nocolor),
+        "info": paint("[*]", BLUE, nocolor),
     }
 
 def progress_bar(done: int, total: int, nocolor: bool, width: int = 28):

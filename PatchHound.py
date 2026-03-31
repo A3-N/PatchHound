@@ -45,14 +45,10 @@ def main():
         p_patch.print_help()
         sys.exit(0)
 
-    # Intercept subcommand runs missing all required arguments to just print help instead of erroring
-    if len(sys.argv) == 2:
-        if sys.argv[1] == "auth":
-            p_auth.print_help()
-            sys.exit(0)
-        elif sys.argv[1] == "patch":
-            p_patch.print_help()
-            sys.exit(0)
+    # Intercept subcommand runs missing required arguments to just print help instead of erroring
+    if len(sys.argv) == 2 and sys.argv[1] == "patch":
+        p_patch.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
 

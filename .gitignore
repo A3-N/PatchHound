@@ -8,6 +8,7 @@ uv.lock
 
 # dumps / secrets
 *.dit
+*.txt
 *ntds*
 *.pot
 *.potfile

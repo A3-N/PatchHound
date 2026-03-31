@@ -75,7 +75,8 @@ def run(args, markers: dict, no_color: bool):
         raise RuntimeError(f"Request failed: {e}")
 
     if args.verbose:
-        print(f"{markers['info']} Response status: {resp.status_code}")
+        status_marker = markers['ok'] if resp.status_code < 400 else markers['warn']
+        print(f"{status_marker} Response status: {resp.status_code}")
         try:
             body = resp.json()
             redacted = body
