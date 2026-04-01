@@ -19,6 +19,7 @@ APPLY_STEP = 50
 API_BATCH = 500
 
 HEX32 = re.compile(r'\b[a-fA-F0-9]{32}\b')
+LM_NT_RE = re.compile(r'\b([a-fA-F0-9]{32}):([a-fA-F0-9]{32})\b')
 HEX_WRAP = re.compile(r'^\s*\$HEX\[([0-9A-Fa-f]+)\]\s*$')
 UPN_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 
@@ -189,7 +190,8 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
         "excluded_count": 0,
         "excluded_lines": [],
     }
-    records: List[Dict[str, str]] = []
+    # Use a dict keyed by (account_lower) so later NT hashes always overwrite
+    records_by_acct: Dict[str, Dict[str, str]] = {}
     hashes_seen = set()
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -203,10 +205,20 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
                 stats["excluded_count"] += 1
                 continue
 
-            hashes = HEX32.findall(s)
-            if hashes:
+            # Look for the LM:NT pattern — two consecutive 32-hex values
+            # separated by a colon.  The NT hash is always the second one.
+            lm_nt_matches = LM_NT_RE.findall(s)
+            if lm_nt_matches:
+                # Each match is (lm_hash, nt_hash); take the NT from the
+                # first LM:NT pair found on this line.
+                nt_hash = lm_nt_matches[0][1].lower()
                 stats["lines_with_hash"] += 1
-                stats["hashes_total"] += len(hashes)
+                stats["hashes_total"] += 1
+            else:
+                # No LM:NT pair — skip this line
+                stats["excluded_lines"].append(f"no_lm_nt_pair | {line}")
+                stats["excluded_count"] += 1
+                continue
 
             tokens = [p for p in re.split(r'[:\s,;]+', s) if p]
             acct = _canonicalize_account(tokens)
@@ -214,11 +226,6 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
 
             if acct:
                 stats["accounts_total"] += 1
-
-            if not hashes:
-                stats["excluded_lines"].append(f"no_32hex_hash | {line}")
-                stats["excluded_count"] += 1
-                continue
 
             if not acct:
                 stats["excluded_lines"].append(f"no_account_token | {line}")
@@ -232,23 +239,18 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
             rec_sam = (sam or "").upper()
             rec_upn = (upn or "").upper()
 
-            for h in hashes:
-                h = h.lower()
-                records.append({"name": acct, "sam": rec_sam, "upn": rec_upn, "nt": h})
-                hashes_seen.add(h)
-                stats["valid_records"] += 1
+            # Always overwrite — the last NT hash seen for this account wins
+            acct_key = acct.lower()
+            records_by_acct[acct_key] = {
+                "name": acct, "sam": rec_sam, "upn": rec_upn, "nt": nt_hash
+            }
+            hashes_seen.add(nt_hash)
+            stats["valid_records"] += 1
 
-    seen_pairs = set()
-    out_records: List[Dict[str, str]] = []
-    for rec in records:
-        key = (rec["name"].lower(), rec["nt"])
-        if key in seen_pairs:
-            continue
-        seen_pairs.add(key)
-        out_records.append(rec)
+    out_records = list(records_by_acct.values())
 
     stats["unique_hashes"] = len(hashes_seen)
-    stats["pairs_total"] = len(records)
+    stats["pairs_total"] = stats["valid_records"]
     stats["unique_pairs"] = len(out_records)
     stats["_records"] = out_records
     return stats
