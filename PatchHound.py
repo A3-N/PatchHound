@@ -4,6 +4,7 @@ import sys
 from src import pwetty
 from src.auth import run as auth_run
 from src.patch import run as patch_run
+from src.policy import run as policy_run
 
 
 def build_parser():
@@ -29,10 +30,15 @@ def build_parser():
     p_patch.add_argument("--db-user", help="Neo4j user (overrides src/conn.py DEFAULT_USER)")
     p_patch.add_argument("--db-pass", help="Neo4j password (overrides src/conn.py DEFAULT_PASS)")
 
-    return parser, p_auth, p_patch
+    p_policy = subparsers.add_parser("policy", help="Offline password policy audit — no Neo4j or API needed", formatter_class=argparse.RawTextHelpFormatter)
+    p_policy.add_argument("-c", "--clears", required=True, help="Path to cleartext credentials file (required)")
+    p_policy.add_argument("-n", "--ntlm", required=True, help="Path to NTLM hashes file (required)")
+    p_policy.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (lists every cracked account)")
+
+    return parser, p_auth, p_patch, p_policy
 
 def main():
-    parser, p_auth, p_patch = build_parser()
+    parser, p_auth, p_patch, p_policy = build_parser()
 
     # Intercept empty runs to print comprehensive help
     if len(sys.argv) == 1:
@@ -43,11 +49,17 @@ def main():
         p_auth.print_help()
         print("\n")
         p_patch.print_help()
+        print("\n")
+        p_policy.print_help()
         sys.exit(0)
 
     # Intercept subcommand runs missing required arguments to just print help instead of erroring
     if len(sys.argv) == 2 and sys.argv[1] == "patch":
         p_patch.print_help()
+        sys.exit(0)
+
+    if len(sys.argv) == 2 and sys.argv[1] == "policy":
+        p_policy.print_help()
         sys.exit(0)
 
     args = parser.parse_args()
@@ -72,6 +84,17 @@ def main():
     elif args.command == "patch":
         try:
             patch_run(args, markers=m, no_color=args.no_color)
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print(f"\n{m['warn']} CTRL+C detected, exiting cleanly.")
+            sys.exit(130)
+        except Exception as e:
+            print(f"{m['warn']} {e}")
+            sys.exit(1)
+
+    elif args.command == "policy":
+        try:
+            policy_run(args, markers=m, no_color=args.no_color)
             sys.exit(0)
         except KeyboardInterrupt:
             print(f"\n{m['warn']} CTRL+C detected, exiting cleanly.")

@@ -12,6 +12,7 @@ Credential importer + “Owned” tagging for **BloodHound Community Edition (CE
 
 - **auth** — log in to BloodHound CE and cache a JWT (used by other commands for API).
 - **patch** — read a **potfile** (cracked creds) + **NTLM file**, parse, stats, and update graph nodes in Neo4j.  
+- **policy** — offline password audit using the same **potfile** + **NTLM file**; no Neo4j or API needed.
   - Always sets:
     - `Patchhound_has_hash` **(bool)**
     - `Patchhound_has_pass` **(bool)** – true when a cracked password is known
@@ -152,7 +153,26 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
         PUT http://localhost:8080/api/v2/asset-groups/2/selectors
         payload: [{"selector_name":"Manual","sid":"S-1-5-21-...","action":"add"}]
   ```
-  
+
+---
+
+### 4) Policy (offline password audit)
+```bash
+python3 PatchHound.py policy -c crack.potfile -n ntds.txt [-v]
+```
+
+Runs entirely offline — no Neo4j, no API, no session required.  
+Correlates the potfile against the NTLM dump and prints a tabular audit covering:
+
+- **Overview** — total accounts, cracked vs. uncracked, empty/blank passwords, unique password count.
+- **Password Length Distribution** — bucketed counts (1-4, 5-7, 8-10, 11-14, 15+ chars).
+- **Top Reused Passwords** — most shared passwords across accounts.
+- **Service / Privileged Accounts** — cracked accounts whose SAM name contains `svc`, `admin`, `sql`, `backup`, `adm`, or `dev`.
+- **Recurring Patterns** — most frequent substrings (3-12 chars) found across passwords (e.g. `@123`, `corp`, `2024!`).
+- **Special Character Usage** — per-character frequency table for punctuation/symbols.
+
+With `-v`, a full table of every cracked account and its password is appended at the end.
+
 ---
 
 ## Flags (current)
@@ -169,6 +189,9 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
   - `-u, --url`
   - `-U, --username`
   - `-p, --password`
+- `policy`:
+  - `-c, --clears` — path to potfile (**required**)
+  - `-n, --ntlm` — path to NTLM hash file (**required**)
 
 ---
 
