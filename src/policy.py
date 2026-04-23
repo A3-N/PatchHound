@@ -20,14 +20,7 @@ SVC_KEYWORDS = re.compile(
     r"(svc|admin|sql|backup|adm|dev)", re.IGNORECASE
 )
 
-# Length buckets for the distribution chart.
-LENGTH_BUCKETS = [
-    ("1-4",   1,  4),
-    ("5-7",   5,  7),
-    ("8-10",  8,  10),
-    ("11-14", 11, 14),
-    ("15+",   15, None),
-]
+
 
 TOP_REUSED_LIMIT = 15
 TOP_PATTERNS_LIMIT = 15
@@ -167,16 +160,11 @@ def _build_audit(records: List[Dict], cracked_map: Dict[str, str]):
 
     unique_passwords = len(pw_counter)
 
-    # ── length distribution ─────────────────────────────────────────
-    length_dist: Dict[str, int] = {label: 0 for label, _, _ in LENGTH_BUCKETS}
+    # ── length distribution (per-length) ────────────────────────────
+    length_dist: Dict[int, int] = defaultdict(int)
     for pw in pw_counter:
         plen = len(pw)
-        for label, lo, hi in LENGTH_BUCKETS:
-            if hi is None:
-                if plen >= lo:
-                    length_dist[label] += pw_counter[pw]
-            elif lo <= plen <= hi:
-                length_dist[label] += pw_counter[pw]
+        length_dist[plen] += pw_counter[pw]
 
     # ── special character analysis ──────────────────────────────────
     has_special_count = 0
@@ -244,7 +232,7 @@ def _print_overview(markers, audit: dict):
             ["Cracked",                 str(cracked),   f"{_pct(cracked, total)}%"],
             ["Not cracked",             str(uncracked), f"{_pct(uncracked, total)}%"],
             ["Empty / blank passwords", str(empty),     f"{_pct(empty, total)}%"],
-            ["Unique passwords",        str(unique),    ""],
+            ["Unique passwords",        str(unique),    f"{_pct(unique, cracked)}%"],
         ],
         col_align=["<", ">", ">"],
     )
@@ -256,12 +244,17 @@ def _print_length_dist(markers, audit: dict):
 
     print(f"{markers['info']} Password Length Distribution")
     rows = []
-    for label, _, _ in LENGTH_BUCKETS:
-        count = dist.get(label, 0)
-        rows.append([f"{label} chars", str(count), f"{_pct(count, cracked)}%"])
+
+    if not dist:
+        print("    No cracked passwords to measure.")
+        return
+
+    for length in sorted(dist.keys()):
+        count = dist[length]
+        rows.append([str(length), str(count), f"{_pct(count, cracked)}%"])
 
     rows.append(["Total", str(cracked), "100%"])
-    _table(["Range", "Count", "%"], rows, col_align=["<", ">", ">"])
+    _table(["Length", "Count", "%"], rows, col_align=[">", ">", ">"])
 
 
 def _print_special_chars(markers, audit: dict):
@@ -303,19 +296,34 @@ def _print_reused(markers, audit: dict):
     print(f"{markers['info']} Top Reused Passwords")
     if not reused:
         print("    No reused passwords detected.")
-        return
+    else:
+        rows = []
+        for pw, cnt in reused[:TOP_REUSED_LIMIT]:
+            display = pw if pw else "(empty)"
+            if len(display) > 30:
+                display = display[:27] + "..."
+            rows.append([display, str(cnt)])
 
-    rows = []
-    for pw, cnt in reused[:TOP_REUSED_LIMIT]:
-        display = pw if pw else "(empty)"
-        if len(display) > 30:
-            display = display[:27] + "..."
-        rows.append([display, str(cnt)])
+        total_reused = sum(cnt for _, cnt in reused)
+        distinct_reused = len(reused)
+        rows.append([f"Total ({distinct_reused} passwords)", str(total_reused)])
+        _table(["Password", "Accounts"], rows, col_align=["<", ">"])
 
-    total_reused = sum(cnt for _, cnt in reused)
-    distinct_reused = len(reused)
-    rows.append([f"Total ({distinct_reused} passwords)", str(total_reused)])
-    _table(["Password", "Accounts"], rows, col_align=["<", ">"])
+    # ── Shortest & longest passwords (immediately after reused table) ──
+    all_pws = [pw for pw in pw_counter if pw and not pw.isspace()]
+    if all_pws:
+        by_len = sorted(all_pws, key=lambda p: (len(p), p))
+        shortest = by_len[:3]
+        longest = by_len[-3:][::-1]  # longest first
+
+        ext_rows = []
+        for pw in shortest:
+            display = pw if len(pw) <= 30 else pw[:27] + "..."
+            ext_rows.append(["Shortest", display, str(len(pw))])
+        for pw in longest:
+            display = pw if len(pw) <= 30 else pw[:27] + "..."
+            ext_rows.append(["Longest", display, str(len(pw))])
+        _table(["Type", "Password", "Length"], ext_rows, col_align=["<", "<", ">"])
 
 
 def _print_svc_accounts(markers, audit: dict):
