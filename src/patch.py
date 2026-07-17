@@ -268,11 +268,11 @@ def _pre_match(session, rows):
     OPTIONAL MATCH (c:Computer)
       WHERE r.sam <> '' AND toUpper(coalesce(c.samaccountname,'')) = r.sam
     WITH r,
-         (CASE WHEN u_exact IS NULL THEN [] ELSE [u_exact] END) +
-         (CASE WHEN u_sam   IS NULL THEN [] ELSE [u_sam]   END) +
-         (CASE WHEN u_upn   IS NULL THEN [] ELSE [u_upn]   END) +
-         (CASE WHEN az_upn  IS NULL THEN [] ELSE [az_upn]  END) +
-         (CASE WHEN c       IS NULL THEN [] ELSE [c]       END) AS targets
+         collect(DISTINCT u_exact) +
+         collect(DISTINCT u_sam) +
+         collect(DISTINCT u_upn) +
+         collect(DISTINCT az_upn) +
+         collect(DISTINCT c) AS targets
     WITH {r:r, has:size(targets)>0} AS row
     RETURN
       [x IN collect(row) WHERE NOT x.has | x.r] AS missing,
