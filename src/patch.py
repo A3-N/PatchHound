@@ -22,6 +22,7 @@ HEX32 = re.compile(r'\b[a-fA-F0-9]{32}\b')
 LM_NT_RE = re.compile(r'\b([a-fA-F0-9]{32}):([a-fA-F0-9]{32})\b')
 HEX_WRAP = re.compile(r'^\s*\$HEX\[([0-9A-Fa-f]+)\]\s*$')
 UPN_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+NTDS_STATUS_RE = re.compile(r'\(\s*status\s*=\s*(enabled|disabled)\s*\)', re.IGNORECASE)
 
 EXCLUDED_PRINT_LIMIT = 200
 HEX_PRINT_LIMIT = 200
@@ -223,6 +224,8 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
             tokens = [p for p in re.split(r'[:\s,;]+', s) if p]
             acct = _canonicalize_account(tokens)
             upn = _extract_upn(tokens)
+            status_match = NTDS_STATUS_RE.search(s)
+            status = status_match.group(1).lower() if status_match else ""
 
             if acct:
                 stats["accounts_total"] += 1
@@ -242,7 +245,11 @@ def _analyze_ntlm_file(path: str) -> Dict[str, object]:
             # Always overwrite — the last NT hash seen for this account wins
             acct_key = acct.lower()
             records_by_acct[acct_key] = {
-                "name": acct, "sam": rec_sam, "upn": rec_upn, "nt": nt_hash
+                "name": acct,
+                "sam": rec_sam,
+                "upn": rec_upn,
+                "nt": nt_hash,
+                "status": status,
             }
             hashes_seen.add(nt_hash)
             stats["valid_records"] += 1

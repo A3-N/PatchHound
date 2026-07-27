@@ -346,6 +346,7 @@ def _print_svc_accounts(markers, audit: dict):
 
 def run(args, markers=None, no_color=False) -> bool:
     nocolor = bool(no_color) if no_color is not None else bool(getattr(args, "no_color", False))
+    enabled_only = bool(getattr(args, "enabled", False))
     verbose = bool(getattr(args, "verbose", False))
 
     if markers is None:
@@ -390,6 +391,8 @@ def run(args, markers=None, no_color=False) -> bool:
         elif pwd is not None and cracked_map.get(existing["nt"]) is None:
             merged[key] = rec
     deduped = list(merged.values())
+    if enabled_only:
+        deduped = [rec for rec in deduped if rec.get("status") == "enabled"]
 
     audit = _build_audit(deduped, cracked_map)
 

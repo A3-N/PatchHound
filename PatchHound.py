@@ -33,6 +33,7 @@ def build_parser():
     p_policy = subparsers.add_parser("policy", help="Offline password policy audit — no Neo4j or API needed", formatter_class=argparse.RawTextHelpFormatter)
     p_policy.add_argument("-c", "--clears", required=True, help="Path to cleartext credentials file (required)")
     p_policy.add_argument("-n", "--ntlm", required=True, help="Path to NTLM hashes file (required)")
+    p_policy.add_argument("-e", "--enabled", action="store_true", help="Only include NTDS entries marked (status=Enabled)")
     p_policy.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (lists every cracked account)")
 
     return parser, p_auth, p_patch, p_policy
