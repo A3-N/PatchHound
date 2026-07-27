@@ -30,27 +30,6 @@ Verbose output via `-v`, I love verbose, can't miss an import.
 
 ---
 
-## What’s New (this version)
-
-- **Minimal graph writes by default:** only `Patchhound_has_hash` and `Patchhound_has_pass`.
-- **Temporary writes with `-t`:** add `Patchhound_nt` and `Patchhound_pass`.
-- **“Owned” via API with `-o`:**  
-  - Query Neo4j for `:User` nodes where `Patchhound_has_pass = true` and a non-empty SID (`objectid`).  
-  - Also note which of those SIDs have a linked `:AZUser` with the same **on‑prem SID**.  
-  - Append those SIDs to an **asset group** using `PUT /api/v2/asset-groups/{id}/selectors`.
-- **Better identity matching (no fallbacks; union of all paths):**  
-  - `:User {name}` (e.g., `DOM\sam`)  
-  - `:User.samaccountname`  
-  - `:User.userprincipalname` / `userPrincipalName`  
-  - `:AZUser.userprincipalname` / `userPrincipalName`  
-  - `:Computer.samaccountname`  
-  - Case-insensitive comparisons for SAM/UPN; UPN can be **synthesized** from `dom.com\SAM → SAM@dom.com` when UPN token isn’t present.
-- **Cleaner output:**  
-  - Non-verbose: just the green checks `JWT valid`, `Potfile Check`, `NTLM Check`, `Neo4j auth OK`, plus “Waiting…” banners before progress bars.  
-  - Verbose: pretty, line-per-stat blocks; `$HEX[...]` decodes printed as `nthash:HEXHASHCAT:password`; excluded lines (with reasons).
-
----
-
 ## Installation
 
 ```bash
@@ -193,27 +172,6 @@ With `-v`, a full table of every cracked account and its password is appended at
   - `-c, --clears` — path to potfile (**required**)
   - `-n, --ntlm` — path to NTLM hash file (**required**)
   - `-e, --enabled` — include only NTDS entries marked `(status=Enabled)`
-
----
-
-## Notes & Caveats
-
-- BloodHound CE typically does **not** persist arbitrary custom node properties across container restarts; the temporary fields (`Patchhound_nt`, `Patchhound_pass`) are intended as **ephemeral conveniences**.
-- UPNs can be lower or upper; comparisons are case-insensitive. For logs, you might see uppercase normalization.
-- `:AZUser` often lacks `samAccountName`; when hybrid, an on-prem SID may be available under several different property names. The matcher checks the common ones.
-
----
-
-## Troubleshooting
-
-- `Neo4j driver not installed` → `pip install neo4j`
-- `JWT invalid` → re-run `auth`
-- No updates applied:
-  - Potfile has no valid lines (format must be `32hex:password`)
-  - NTLM file had no `(acct, hash)` pairs
-- Owned append failed:
-  - Check API base URL and JWT in the session file
-  - Verify your account can mutate asset groups; AAD proxy / reverse proxy headers can interfere
 
 ---
 
