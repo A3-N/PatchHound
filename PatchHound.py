@@ -29,6 +29,7 @@ def build_parser():
     p_patch.add_argument("--db-uri", help="Neo4j URI (overrides src/conn.py DEFAULT_URI)")
     p_patch.add_argument("--db-user", help="Neo4j user (overrides src/conn.py DEFAULT_USER)")
     p_patch.add_argument("--db-pass", help="Neo4j password (overrides src/conn.py DEFAULT_PASS)")
+    p_patch.add_argument("--owned-seeds-per-selector", type=int, help="Group this many SID seeds into each Owned selector request (default: env PATCHHOUND_OWNED_SEEDS_PER_SELECTOR or 1)")
 
     p_policy = subparsers.add_parser("policy", help="Offline password policy audit — no Neo4j or API needed", formatter_class=argparse.RawTextHelpFormatter)
     p_policy.add_argument("-c", "--clears", required=True, help="Path to cleartext credentials file (required)")

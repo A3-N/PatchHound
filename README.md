@@ -59,10 +59,19 @@ python3 PatchHound.py [--no-color] [subcommand] -h
 python3 PatchHound.py auth -u http://localhost:8080/ -U admin -p 'Exclude -p for PassPrompt' [-v]
 ```
 - Writes a session file at: `${TMPDIR}/patchhound.session.json`
+- Stores the BloodHound username with the JWT so long `patch -o` runs can renew an expired token.
 
 ### 2) Patch (parse files, set minimal flags; optional temp writes)
 ```bash
 python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
+```
+
+For unattended long `-o/--owned` uploads, provide API renewal credentials through environment variables instead of putting the API secret in shell history:
+
+```bash
+export PATCHHOUND_API_USER=admin
+export PATCHHOUND_API_PASS='BloodHound password or secret'
+python3 PatchHound.py patch -c crack.potfile -n ntds.txt -o
 ```
 
 **What it reads**
@@ -77,7 +86,8 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
   - Non-conforming lines are excluded with reasons (verbose).
 
 **How matching works (Neo4j)**
-- For each candidate row we try all of these simultaneously:
+- By default, PatchHound builds a local lookup of BloodHound `User`, `AZUser`, and `Computer` nodes once, matches input rows in Python, and then writes matched nodes back to Neo4j by node ID in large batches. This avoids repeated Cypher scans for large NTDS imports.
+- Matching still follows the same fields:
   - `(:User {name})`
   - `(:User).samaccountname`
   - `(:User).userprincipalname | userPrincipalName`
@@ -111,13 +121,17 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
 - After patching (or even when nothing is applied), `-o` will:
   1. Query **Neo4j** for users where `Patchhound_has_pass = true` and a non-empty SID (`u.objectid`).
   2. Count how many of those SIDs have a matching `:AZUser` on‑prem SID (several property names supported).
-  3. **Append** those SIDs to the configured **asset group** via BHCE v2 API.
+  3. Best-effort query existing Owned selectors and skip duplicate SIDs on re-runs.
+  4. **Append** those SIDs to the configured **asset group tag** via BHCE v2 API.
+  5. Renew the BHCE token and retry the in-flight selector if the API returns `401`.
+
+- For large imports, use `--owned-seeds-per-selector` to group many SID seeds into each selector request. This can reduce API calls by orders of magnitude. A value of `100`–`500` is usually appropriate when the BloodHound API accepts multi-seed selectors.
 
 - Non-verbose:
   ```
   [+] Waiting for Neo4j and API
   Owned API [████████████████████████████] 1876/1876 (100%)
-  [+] Owned API: attempted 1876 selector adds
+  [+] Owned API: attempted 1876/1876 seed(s) in 4/4 request(s), added 1800, already existed 76, failed 0, pre-skipped 0, 429 retries 3
   ```
 
 - Verbose final summary (printed **after** all logic):
@@ -127,10 +141,17 @@ python3 PatchHound.py patch -c crack.potfile -n ntds.txt [-t] [-o] [-v]
       with_sid                  : 1876
       distinct_sids_sent        : 1876
       sids_with_azuser_link     : 0
-      asset_group_id            : 2
+      asset_group_tag_id        : 2
+      owned_attempted           : 1876
+      owned_added               : 1800
+      owned_existing_or_conflict: 76
+      owned_pre_skipped         : 0
+      owned_failed              : 0
+      owned_429_retries         : 3
+      owned_selector_requests   : 4/4
       example_request:
-        PUT http://localhost:8080/api/v2/asset-groups/2/selectors
-        payload: [{"selector_name":"Manual","sid":"S-1-5-21-...","action":"add"}]
+        POST http://localhost:8080/api/v2/asset-group-tags/2/selectors
+        payload: {"name":"PatchHound Owned 20260923123456 000001","seeds":[{"type":1,"value":"S-1-5-21-..."},{"type":1,"value":"S-1-5-21-..."}]}
   ```
 
 ---
@@ -164,6 +185,7 @@ With `-v`, a full table of every cracked account and its password is appended at
   - `-t, --temp` — write `Patchhound_nt` and `Patchhound_pass`
   - `-o, --owned` — append “Owned” selectors via API based on Neo4j discovery
   - `--db-uri`, `--db-user`, `--db-pass` — override Neo4j connection defaults
+  - `--owned-seeds-per-selector` — group multiple SID seeds into each Owned selector request
 - `auth`:
   - `-u, --url`
   - `-U, --username`
