@@ -108,7 +108,7 @@ def run(args, markers: dict, no_color: bool):
         print(f"{markers['warn']} {_extract_error_message(resp)}")
         return
 
-    _atomic_write_json({"base_url": base, "session_token": token})
+    _atomic_write_json({"base_url": base, "session_token": token, "username": username})
 
     if args.verbose:
         print(f"{markers['ok']} session stored (tmp): {SESSION_PATH}")
